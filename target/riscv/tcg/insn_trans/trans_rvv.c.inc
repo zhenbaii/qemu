@@ -291,8 +291,16 @@ static bool do_vset_imm_continue(DisasContext *s, int rd, int rs1,
         /* rd != x0 makes this the AVL = ~0 form, hence VL = VLMAX. */
         s->vl_eq_vlmax = (vlmax << s->sew) >= 8;
     } else {
-        /* A dynamic AVL may equal VLMAX, but false is always safe. */
+        /*
+         * A dynamic AVL may equal VLMAX.  False is conservative for the
+         * remainder of this TB, but the runtime value must be part of the
+         * successor lookup.  Do not direct-chain this TB to whichever
+         * VL_EQ_VLMAX target happened to run first.
+         */
         s->vl_eq_vlmax = false;
+        if (legal) {
+            s->outgoing_tb_key_dynamic = true;
+        }
     }
     return true;
 }

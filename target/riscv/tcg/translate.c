@@ -104,6 +104,13 @@ typedef struct DisasContext {
     bool vstart_eq_zero;
     bool vl_eq_vlmax;
     bool altfmt;
+    /*
+     * The TB has executed an instruction whose outgoing TB key cannot be
+     * determined at translation time.  The current TB may still continue
+     * with conservative state, but a direct chain to a successor would pin
+     * the first runtime key seen by this TB.
+     */
+    bool outgoing_tb_key_dynamic;
     CPUState *cs;
     TCGv zero;
     /* actual address width */
@@ -318,7 +325,8 @@ static void gen_goto_tb(DisasContext *ctx, unsigned tb_slot_idx,
       * Under itrigger, instruction executes one by one like singlestep,
       * direct block chain benefits will be small.
       */
-    if (translator_use_goto_tb(&ctx->base, dest) &&
+    if (!ctx->outgoing_tb_key_dynamic &&
+        translator_use_goto_tb(&ctx->base, dest) &&
         !ctx->itrigger && !ctx->sdext_step) {
         /*
          * For pcrel, the pc must always be up-to-date on entry to
@@ -1346,6 +1354,7 @@ static void riscv_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->vstart_eq_zero = FIELD_EX32(tb_flags, TB_FLAGS, VSTART_EQ_ZERO);
     ctx->vl_eq_vlmax = FIELD_EX32(tb_flags, TB_FLAGS, VL_EQ_VLMAX);
     ctx->altfmt = FIELD_EX64(ext_tb_flags, EXT_TB_FLAGS, ALTFMT);
+    ctx->outgoing_tb_key_dynamic = false;
     ctx->misa_mxl_max = mcc->def->misa_mxl_max;
     ctx->xl = FIELD_EX32(tb_flags, TB_FLAGS, XL);
     ctx->address_xl = FIELD_EX32(tb_flags, TB_FLAGS, AXL);
