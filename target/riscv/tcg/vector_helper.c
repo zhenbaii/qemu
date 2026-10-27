@@ -33,22 +33,6 @@
 #include "vector_internals.h"
 #include <math.h>
 
-static target_ulong vtype_reserved(CPURISCVState *env, target_ulong vtype)
-{
-    int xlen = riscv_cpu_xlen(env);
-    target_ulong reserved = 0;
-
-    if (riscv_cpu_cfg(env)->ext_zvfbfa) {
-        reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_RESERVED_SHIFT,
-                                           xlen - 1 - R_VTYPE_RESERVED_SHIFT);
-    } else {
-        reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_ALTFMT_SHIFT,
-                                           xlen - 1 - R_VTYPE_ALTFMT_SHIFT);
-    }
-
-    return reserved;
-}
-
 static inline void reset_ill_vtype(CPURISCVState *env)
 {
     /* only set vill bit. */
@@ -63,51 +47,14 @@ target_ulong HELPER(vsetvl)(CPURISCVState *env, target_ulong s1,
 {
     int vlmax, vl;
     RISCVCPU *cpu = env_archcpu(env);
-    uint64_t vlmul = FIELD_EX64(s2, VTYPE, VLMUL);
-    uint8_t vsew = FIELD_EX64(s2, VTYPE, VSEW);
-    uint16_t sew = 8 << vsew;
-    uint8_t altfmt = FIELD_EX64(s2, VTYPE, ALTFMT);
-    bool ill_altfmt = true;
-    int xlen = riscv_cpu_xlen(env);
-    bool vill = (s2 >> (xlen - 1)) & 0x1;
-    int8_t lmul;
+    RISCVVType decoded;
 
-    if (vlmul & 4) {
-        /*
-         * Fractional LMUL, check:
-         *
-         * ELEN * LMUL >= SEW
-         * ELEN >> (8 - vlmul) >= sew
-         */
-        if (vlmul == 4 ||
-            (cpu->cfg.elen >> (8 - vlmul)) < sew) {
-            vill = true;
-        }
-    }
-
-    switch (vsew) {
-    case MO_8:
-        ill_altfmt &= !(cpu->cfg.ext_zvfbfa);
-        break;
-    case MO_16:
-        ill_altfmt &= !(cpu->cfg.ext_zvfbfa);
-        break;
-    default:
-        break;
-    }
-
-    if (altfmt && ill_altfmt) {
-        vill = true;
-    }
-
-    if ((sew > cpu->cfg.elen) || vill || (vtype_reserved(env, s2) != 0)) {
+    if (!riscv_decode_vtype(&cpu->cfg, riscv_cpu_xlen(env), s2, &decoded)) {
         reset_ill_vtype(env);
         return 0;
     }
 
-    /* lmul encoded as in DisasContext::lmul */
-    lmul = sextract32(FIELD_EX64(s2, VTYPE, VLMUL), 0, 3);
-    vlmax = vext_get_vlmax(cpu->cfg.vlenb, vsew, lmul);
+    vlmax = decoded.vlmax;
     if (s1 <= vlmax) {
         vl = s1;
     } else if (s1 < 2 * vlmax && cpu->cfg.rvv_vl_half_avl) {

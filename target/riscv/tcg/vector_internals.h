@@ -32,6 +32,18 @@
     }                                         \
 } while (0)
 
+typedef struct RISCVVType {
+    uint32_t vlmax;
+    int8_t lmul;
+    uint8_t vsew;
+    bool vta;
+    bool vma;
+    bool altfmt;
+} RISCVVType;
+
+bool riscv_decode_vtype(const RISCVCPUConfig *cfg, int xlen,
+                        uint64_t vtype, RISCVVType *decoded);
+
 static inline uint32_t vext_nf(uint32_t desc)
 {
     return FIELD_EX32(simd_data(desc), VDATA, NF);
