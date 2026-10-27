@@ -30,6 +30,7 @@
 #include "semihosting/semihost.h"
 
 #include "internals.h"
+#include "vector_internals.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"

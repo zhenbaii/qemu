@@ -221,6 +221,82 @@ static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
     return true;
 }
 
+/*
+ * Update the translation-time vector state for an immediate vtype.
+ *
+ * Decode vtype with the same pure helper used by helper_vsetvl().  Keeping
+ * this information in DisasContext lets the translator continue past
+ * vset{i}vli without pretending that a register-supplied vtype is known.
+ */
+#ifdef CONFIG_USER_ONLY
+static bool update_vtype_imm_state(DisasContext *s, uint64_t vtype,
+                                   uint32_t *vlmax)
+{
+    RISCVVType decoded;
+    bool legal = riscv_decode_vtype(s->cfg_ptr, TARGET_LONG_BITS,
+                                    vtype, &decoded);
+
+    s->vill = !legal;
+    s->vstart_eq_zero = true;
+    if (!legal) {
+        /* helper_vsetvl() resets an illegal vtype to zero. */
+        s->sew = 0;
+        s->lmul = 0;
+        s->vta = 0;
+        s->vma = 0;
+        s->altfmt = false;
+        s->vl_eq_vlmax = false;
+        *vlmax = 0;
+        return false;
+    }
+
+    s->sew = decoded.vsew;
+    s->lmul = decoded.lmul;
+    s->vta = decoded.vta && s->cfg_ptr->rvv_ta_all_1s;
+    s->vma = decoded.vma && s->cfg_ptr->rvv_ma_all_1s;
+    s->altfmt = decoded.altfmt;
+    *vlmax = decoded.vlmax;
+    return true;
+}
+
+static bool do_vset_imm_continue(DisasContext *s, int rd, int rs1,
+                                 uint64_t vtype, bool avl_is_imm,
+                                 uint32_t avl_imm)
+{
+    TCGv s1 = avl_is_imm ? tcg_constant_tl(avl_imm) :
+              rs1 == 0 ? tcg_constant_tl(RV_VLEN_MAX) :
+                         get_gpr(s, rs1, EXT_ZERO);
+    TCGv dst = dest_gpr(s, rd);
+    uint32_t vlmax;
+    bool legal;
+
+    gen_helper_vsetvl(dst, tcg_env, s1, tcg_constant_tl(vtype),
+                      tcg_constant_tl(0));
+    gen_set_gpr(s, rd, dst);
+    finalize_rvv_inst(s);
+
+    legal = update_vtype_imm_state(s, vtype, &vlmax);
+    if (legal && avl_is_imm) {
+        uint32_t vl;
+
+        if (avl_imm <= vlmax) {
+            vl = avl_imm;
+        } else if (avl_imm < 2 * vlmax && s->cfg_ptr->rvv_vl_half_avl) {
+            vl = (avl_imm + 1) >> 1;
+        } else {
+            vl = vlmax;
+        }
+        s->vl_eq_vlmax = vl == vlmax && (vlmax << s->sew) >= 8;
+    } else if (legal && rs1 == 0) {
+        /* rd != x0 makes this the AVL = ~0 form, hence VL = VLMAX. */
+        s->vl_eq_vlmax = (vlmax << s->sew) >= 8;
+    } else {
+        /* A dynamic AVL may equal VLMAX, but false is always safe. */
+        s->vl_eq_vlmax = false;
+    }
+    return true;
+}
+#else
 static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
 {
     TCGv dst;
@@ -230,16 +306,15 @@ static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
     }
 
     dst = dest_gpr(s, rd);
-
     gen_helper_vsetvl(dst, tcg_env, s1, s2, tcg_constant_tl(0));
     gen_set_gpr(s, rd, dst);
     finalize_rvv_inst(s);
     gen_update_pc(s, s->cur_insn_len);
     lookup_and_goto_ptr(s);
     s->base.is_jmp = DISAS_NORETURN;
-
     return true;
 }
+#endif
 
 static bool trans_vsetvl(DisasContext *s, arg_vsetvl *a)
 {
@@ -249,15 +324,36 @@ static bool trans_vsetvl(DisasContext *s, arg_vsetvl *a)
 
 static bool trans_vsetvli(DisasContext *s, arg_vsetvli *a)
 {
+#ifdef CONFIG_USER_ONLY
+    if (!require_rvv(s) || !s->cfg_ptr->ext_zve32x) {
+        return false;
+    }
+
+    /* This form may depend on the old VL and the x0-vill policy. */
+    if (a->rd == 0 && a->rs1 == 0) {
+        TCGv s2 = tcg_constant_tl(a->zimm);
+        return do_vsetvl(s, a->rd, a->rs1, s2);
+    }
+
+    return do_vset_imm_continue(s, a->rd, a->rs1, a->zimm, false, 0);
+#else
     TCGv s2 = tcg_constant_tl(a->zimm);
     return do_vsetvl(s, a->rd, a->rs1, s2);
+#endif
 }
 
 static bool trans_vsetivli(DisasContext *s, arg_vsetivli *a)
 {
+#ifdef CONFIG_USER_ONLY
+    if (!require_rvv(s) || !s->cfg_ptr->ext_zve32x) {
+        return false;
+    }
+    return do_vset_imm_continue(s, a->rd, 0, a->zimm, true, a->rs1);
+#else
     TCGv s1 = tcg_constant_tl(a->rs1);
     TCGv s2 = tcg_constant_tl(a->zimm);
     return do_vsetivli(s, a->rd, s1, s2);
+#endif
 }
 
 /* vector register offset from env */
