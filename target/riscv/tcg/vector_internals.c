@@ -19,6 +19,47 @@
 #include "qemu/osdep.h"
 #include "vector_internals.h"
 
+bool riscv_decode_vtype(const RISCVCPUConfig *cfg, int xlen,
+                        uint64_t vtype, RISCVVType *decoded)
+{
+    uint32_t vlmul = FIELD_EX64(vtype, VTYPE, VLMUL);
+    uint32_t vsew = FIELD_EX64(vtype, VTYPE, VSEW);
+    uint32_t sew = 8 << vsew;
+    bool altfmt = FIELD_EX64(vtype, VTYPE, ALTFMT);
+    bool ill_altfmt = true;
+    bool vill = (vtype >> (xlen - 1)) & 1;
+    uint64_t reserved;
+
+    if (vlmul & 4) {
+        vill |= vlmul == 4 || (cfg->elen >> (8 - vlmul)) < sew;
+    }
+
+    if (vsew == MO_8 || vsew == MO_16) {
+        ill_altfmt = !cfg->ext_zvfbfa;
+    }
+    vill |= altfmt && ill_altfmt;
+
+    if (cfg->ext_zvfbfa) {
+        reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_RESERVED_SHIFT,
+                                           xlen - 1 - R_VTYPE_RESERVED_SHIFT);
+    } else {
+        reserved = vtype & MAKE_64BIT_MASK(R_VTYPE_ALTFMT_SHIFT,
+                                           xlen - 1 - R_VTYPE_ALTFMT_SHIFT);
+    }
+    vill |= sew > cfg->elen || reserved != 0;
+    if (vill) {
+        return false;
+    }
+
+    decoded->vsew = vsew;
+    decoded->lmul = sextract32(vlmul, 0, 3);
+    decoded->vta = FIELD_EX64(vtype, VTYPE, VTA);
+    decoded->vma = FIELD_EX64(vtype, VTYPE, VMA);
+    decoded->altfmt = altfmt;
+    decoded->vlmax = vext_get_vlmax(cfg->vlenb, vsew, decoded->lmul);
+    return true;
+}
+
 /* set agnostic elements to 1s */
 void vext_set_elems_1s(void *base, uint32_t is_agnostic, uint32_t cnt,
                        uint32_t tot)

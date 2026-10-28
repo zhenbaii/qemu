@@ -221,6 +221,7 @@ static bool do_vsetvl(DisasContext *s, int rd, int rs1, TCGv s2)
     return true;
 }
 
+#ifndef CONFIG_USER_ONLY
 static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
 {
     TCGv dst;
@@ -240,6 +241,173 @@ static bool do_vsetivli(DisasContext *s, int rd, TCGv s1, TCGv s2)
 
     return true;
 }
+#endif
+
+#ifdef CONFIG_USER_ONLY
+static void gen_vset_imm_state(DisasContext *s, int rd, TCGv vl,
+                               uint64_t vtype, bool vill)
+{
+    TCGv_i32 vl32 = tcg_temp_new_i32();
+
+    gen_set_gpr(s, rd, vl);
+    tcg_gen_st_i64(tcg_constant_i64(vtype), tcg_env,
+                   offsetof(CPURISCVState, vtype));
+    tcg_gen_trunc_tl_i32(vl32, vl);
+    tcg_gen_mov_i32(cpu_vl, vl32);
+    tcg_gen_movi_i32(cpu_vstart, 0);
+    tcg_gen_st8_i32(tcg_constant_i32(vill), tcg_env,
+                    offsetof(CPURISCVState, vill));
+    finalize_rvv_inst(s);
+}
+
+static bool do_vsetivli_ir(DisasContext *s, int rd, uint32_t avl,
+                           uint64_t vtype)
+{
+    RISCVVType decoded;
+    uint32_t vl;
+    bool vill;
+
+    if (!require_rvv(s) || !s->cfg_ptr->ext_zve32x) {
+        return false;
+    }
+
+    vill = !riscv_decode_vtype(s->cfg_ptr, TARGET_LONG_BITS,
+                               vtype, &decoded);
+    if (vill) {
+        vtype = 0;
+        vl = 0;
+    } else if (avl <= decoded.vlmax) {
+        vl = avl;
+    } else if (avl < 2 * decoded.vlmax &&
+               s->cfg_ptr->rvv_vl_half_avl) {
+        vl = (avl + 1) >> 1;
+    } else {
+        vl = decoded.vlmax;
+    }
+
+    gen_vset_imm_state(s, rd, tcg_constant_tl(vl), vtype, vill);
+    /*
+     * A direct jump slot requires a unique outgoing TB key for this source
+     * TB.  In user mode, an instruction which may change a non-vector
+     * TB-key field terminates the TB, so such a change cannot precede this
+     * instruction in the same source TB.
+     *
+     * Both AVL and vtype are immediate, and vsetivli deterministically
+     * overwrites every vector-related TB-key field.  The outgoing key is
+     * therefore identical for every execution that reaches this point.
+     */
+    gen_goto_tb(s, 0, s->cur_insn_len);
+    s->base.is_jmp = DISAS_NORETURN;
+    return true;
+}
+
+static void gen_vsetvli_chain_exit(DisasContext *s, TCGv vl, int rd,
+                                   int rs1, uint64_t vtype)
+{
+    RISCVVType decoded;
+    TCGLabel *not_vlmax;
+    target_ulong pc_save = s->pc_save;
+
+    /*
+     * vsetvli x0, x0 keeps the old VL when possible and may set VILL when
+     * it is not.  Its outgoing key therefore cannot be classified only by
+     * the returned VL.
+     */
+    if (rd == 0 && rs1 == 0) {
+        gen_update_pc(s, s->cur_insn_len);
+        lookup_and_goto_ptr(s);
+        return;
+    }
+
+    /* An illegal immediate vtype always produces the same VILL state. */
+    if (!riscv_decode_vtype(s->cfg_ptr, TARGET_LONG_BITS,
+                            vtype, &decoded)) {
+        gen_goto_tb(s, 0, s->cur_insn_len);
+        return;
+    }
+
+    /* AVL = ~0 always produces VL = VLMAX. */
+    if (rs1 == 0) {
+        gen_goto_tb(s, 0, s->cur_insn_len);
+        return;
+    }
+
+    /* GVEC cannot use VL_EQ_VLMAX for vector sizes below eight bytes. */
+    if ((decoded.vlmax << decoded.vsew) < 8) {
+        gen_goto_tb(s, 0, s->cur_insn_len);
+        return;
+    }
+
+    /*
+     * With immediate vtype and register AVL, VL_EQ_VLMAX is the only
+     * outgoing TB-key bit that can vary.  Give its two values independent
+     * jump slots so neither slot can become stale when AVL changes.
+     */
+    not_vlmax = gen_new_label();
+    tcg_gen_brcondi_tl(TCG_COND_NE, vl, decoded.vlmax, not_vlmax);
+    gen_goto_tb(s, 0, s->cur_insn_len);
+    s->pc_save = pc_save;
+    gen_set_label(not_vlmax);
+    gen_goto_tb(s, 1, s->cur_insn_len);
+}
+
+static bool do_vsetvli_chain(DisasContext *s, int rd, int rs1,
+                             uint64_t vtype)
+{
+    RISCVVType decoded;
+    TCGv avl, vl;
+    bool vill;
+
+    if (!require_rvv(s) || !s->cfg_ptr->ext_zve32x) {
+        return false;
+    }
+
+    if (rd == 0 && rs1 == 0) {
+        TCGv old_vl = tcg_temp_new();
+        TCGv dst = dest_gpr(s, rd);
+
+        tcg_gen_ext_i32_tl(old_vl, cpu_vl);
+        gen_helper_vsetvl(dst, tcg_env, old_vl,
+                          tcg_constant_tl(vtype), tcg_constant_tl(1));
+        gen_set_gpr(s, rd, dst);
+        finalize_rvv_inst(s);
+        gen_vsetvli_chain_exit(s, dst, rd, rs1, vtype);
+        s->base.is_jmp = DISAS_NORETURN;
+        return true;
+    }
+
+    vill = !riscv_decode_vtype(s->cfg_ptr, TARGET_LONG_BITS,
+                               vtype, &decoded);
+    if (vill) {
+        vl = tcg_constant_tl(0);
+        gen_vset_imm_state(s, rd, vl, 0, true);
+    } else if (rs1 == 0) {
+        vl = tcg_constant_tl(decoded.vlmax);
+        gen_vset_imm_state(s, rd, vl, vtype, false);
+    } else {
+        avl = get_gpr(s, rs1, EXT_ZERO);
+        vl = tcg_temp_new();
+        tcg_gen_movi_tl(vl, decoded.vlmax);
+
+        if (s->cfg_ptr->rvv_vl_half_avl) {
+            TCGv half = tcg_temp_new();
+
+            tcg_gen_addi_tl(half, avl, 1);
+            tcg_gen_shri_tl(half, half, 1);
+            tcg_gen_movcond_tl(TCG_COND_LTU, vl, avl,
+                               tcg_constant_tl(2 * decoded.vlmax),
+                               half, vl);
+        }
+        tcg_gen_movcond_tl(TCG_COND_LTU, vl, avl,
+                           tcg_constant_tl(decoded.vlmax + 1), avl, vl);
+        gen_vset_imm_state(s, rd, vl, vtype, false);
+    }
+
+    gen_vsetvli_chain_exit(s, vl, rd, rs1, vtype);
+    s->base.is_jmp = DISAS_NORETURN;
+    return true;
+}
+#endif
 
 static bool trans_vsetvl(DisasContext *s, arg_vsetvl *a)
 {
@@ -249,15 +417,23 @@ static bool trans_vsetvl(DisasContext *s, arg_vsetvl *a)
 
 static bool trans_vsetvli(DisasContext *s, arg_vsetvli *a)
 {
+#ifdef CONFIG_USER_ONLY
+    return do_vsetvli_chain(s, a->rd, a->rs1, a->zimm);
+#else
     TCGv s2 = tcg_constant_tl(a->zimm);
     return do_vsetvl(s, a->rd, a->rs1, s2);
+#endif
 }
 
 static bool trans_vsetivli(DisasContext *s, arg_vsetivli *a)
 {
+#ifdef CONFIG_USER_ONLY
+    return do_vsetivli_ir(s, a->rd, a->rs1, a->zimm);
+#else
     TCGv s1 = tcg_constant_tl(a->rs1);
     TCGv s2 = tcg_constant_tl(a->zimm);
     return do_vsetivli(s, a->rd, s1, s2);
+#endif
 }
 
 /* vector register offset from env */
